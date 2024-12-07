@@ -5,7 +5,7 @@ use std::ops::{Bound, RangeBounds};
 /// Concrete struct representing a range of Bytes. Gets around much of
 /// the cumbersome work associated with the generic trait RangeBounds<Bytes>
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct BytesRange {
+pub struct BytesRange {
     start_bound: Bound<Bytes>,
     end_bound: Bound<Bytes>,
 }
