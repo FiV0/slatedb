@@ -48,7 +48,7 @@ use crate::clock::MonotonicClock;
 use crate::clock::{LogicalClock, SystemClock};
 use crate::config::{
     FlushOptions, FlushType, MergeOptions, PreloadLevel, PutOptions, ReadOptions, ScanOptions,
-    Settings, WriteOptions,
+    Settings, SizeApproximationOptions, WriteOptions,
 };
 use crate::db_iter::DbIterator;
 use crate::db_read::DbRead;
@@ -211,11 +211,12 @@ impl DbInner {
 
     /// Get approximate sizes in bytes for the given key ranges.
     ///
-    /// Returns the estimated size of data in SST files that overlap with each
-    /// provided range. This only includes on-disk SST files, not memtables.
+    /// Returns the estimated size of data that overlaps with each provided range,
+    /// based on the options specified.
     pub(crate) fn get_approximate_sizes(
         &self,
         ranges: &[BytesRange],
+        options: &SizeApproximationOptions,
     ) -> Result<Vec<u64>, SlateDBError> {
         self.check_closed()?;
         let db_state = self.state.read().view();
@@ -224,22 +225,35 @@ impl DbInner {
         Ok(ranges
             .iter()
             .map(|range| {
-                // L0 SSTs (check all, they may overlap)
-                let l0_size: u64 = core
-                    .l0
-                    .iter()
-                    .filter(|sst| sst.intersects_range(Unbounded, range))
-                    .map(|sst| sst.estimate_size())
-                    .sum();
+                let mut total_size = 0u64;
 
-                // Compacted sorted runs
-                let compacted_size: u64 = core
-                    .compacted
-                    .iter()
-                    .map(|sr| sr.estimate_range_size(range))
-                    .sum();
+                // Memtables (current + immutable)
+                if options.include_memtables {
+                    total_size += db_state.memtable.estimate_range_size(range.clone());
+                    for imm in db_state.state.imm_memtable.iter() {
+                        total_size += imm.table().estimate_range_size(range.clone());
+                    }
+                }
 
-                l0_size + compacted_size
+                // SST files
+                if options.include_files {
+                    // L0 SSTs (check all, they may overlap)
+                    total_size += core
+                        .l0
+                        .iter()
+                        .filter(|sst| sst.intersects_range(Unbounded, range))
+                        .map(|sst| sst.estimate_size())
+                        .sum::<u64>();
+
+                    // Compacted sorted runs
+                    total_size += core
+                        .compacted
+                        .iter()
+                        .map(|sr| sr.estimate_range_size(range))
+                        .sum::<u64>();
+                }
+
+                total_size
             })
             .collect())
     }
@@ -939,13 +953,80 @@ impl Db {
             .map_err(Into::into)
     }
 
+    /// Get approximate sizes in bytes for the given key ranges with custom options.
+    ///
+    /// Returns the estimated size of data that overlaps with each provided range,
+    /// based on the options specified. This is useful for understanding data
+    /// distribution and planning operations like bulk exports.
+    ///
+    /// The sizes are approximate because partial SST overlaps are counted as
+    /// full SST sizes.
+    ///
+    /// ## Arguments
+    /// - `ranges`: An iterator of key ranges to estimate sizes for
+    /// - `options`: Options controlling which data sources to include
+    ///
+    /// ## Returns
+    /// - `Vec<u64>`: A vector of approximate sizes in bytes, one for each input range
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use slatedb::{Db, Error};
+    /// use slatedb::config::SizeApproximationOptions;
+    /// use slatedb::object_store::memory::InMemory;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let object_store = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///
+    ///     let ranges = vec!["a".."m", "m".."z"];
+    ///     // Only include SST files, not memtables
+    ///     let options = SizeApproximationOptions {
+    ///         include_memtables: false,
+    ///         ..Default::default()
+    ///     };
+    ///     let sizes = db.get_approximate_sizes_with_options(ranges, options).await?;
+    ///     println!("Range a..m: {} bytes", sizes[0]);
+    ///     println!("Range m..z: {} bytes", sizes[1]);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn get_approximate_sizes_with_options<K, T, I>(
+        &self,
+        ranges: I,
+        options: SizeApproximationOptions,
+    ) -> Result<Vec<u64>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+        I: IntoIterator<Item = T> + Send,
+    {
+        let bytes_ranges: Vec<BytesRange> = ranges
+            .into_iter()
+            .map(|range| {
+                let start = range
+                    .start_bound()
+                    .map(|b| Bytes::copy_from_slice(b.as_ref()));
+                let end = range
+                    .end_bound()
+                    .map(|b| Bytes::copy_from_slice(b.as_ref()));
+                BytesRange::from((start, end))
+            })
+            .collect();
+        self.inner
+            .get_approximate_sizes(&bytes_ranges, &options)
+            .map_err(Into::into)
+    }
+
     /// Get approximate sizes in bytes for the given key ranges.
     ///
-    /// Returns the estimated size of data in SST files that overlap with each
-    /// provided range. This is useful for understanding data distribution and
-    /// planning operations like bulk exports.
+    /// Returns the estimated size of data that overlaps with each provided range,
+    /// including both memtables and SST files. This is useful for understanding
+    /// data distribution and planning operations like bulk exports.
     ///
-    /// Note: This only includes on-disk SST files, not in-memory memtables.
     /// The sizes are approximate because partial SST overlaps are counted as
     /// full SST sizes.
     ///
@@ -980,21 +1061,58 @@ impl Db {
         T: RangeBounds<K> + Send,
         I: IntoIterator<Item = T> + Send,
     {
-        let bytes_ranges: Vec<BytesRange> = ranges
-            .into_iter()
-            .map(|range| {
-                let start = range
-                    .start_bound()
-                    .map(|b| Bytes::copy_from_slice(b.as_ref()));
-                let end = range
-                    .end_bound()
-                    .map(|b| Bytes::copy_from_slice(b.as_ref()));
-                BytesRange::from((start, end))
-            })
-            .collect();
-        self.inner
-            .get_approximate_sizes(&bytes_ranges)
-            .map_err(Into::into)
+        self.get_approximate_sizes_with_options(ranges, SizeApproximationOptions::default())
+            .await
+    }
+
+    /// Get approximate size in bytes for a single key range with custom options.
+    ///
+    /// This is a convenience method for getting the size of a single range.
+    /// See [`get_approximate_sizes_with_options`](Self::get_approximate_sizes_with_options) for more details.
+    ///
+    /// ## Arguments
+    /// - `range`: The key range to estimate the size for
+    /// - `options`: Options controlling which data sources to include
+    ///
+    /// ## Returns
+    /// - `u64`: The approximate size in bytes
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use slatedb::{Db, Error};
+    /// use slatedb::config::SizeApproximationOptions;
+    /// use slatedb::object_store::memory::InMemory;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let object_store = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///
+    ///     // Only include memtables, not SST files
+    ///     let options = SizeApproximationOptions {
+    ///         include_files: false,
+    ///         ..Default::default()
+    ///     };
+    ///     let size = db.get_approximate_size_with_options("a".."z", options).await?;
+    ///     println!("Range a..z: {} bytes", size);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn get_approximate_size_with_options<K, T>(
+        &self,
+        range: T,
+        options: SizeApproximationOptions,
+    ) -> Result<u64, crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+    {
+        let sizes = self
+            .get_approximate_sizes_with_options([range], options)
+            .await?;
+        Ok(sizes.into_iter().next().unwrap_or(0))
     }
 
     /// Get approximate size in bytes for a single key range.
@@ -1030,8 +1148,8 @@ impl Db {
         K: AsRef<[u8]> + Send,
         T: RangeBounds<K> + Send,
     {
-        let sizes = self.get_approximate_sizes([range]).await?;
-        Ok(sizes.into_iter().next().unwrap_or(0))
+        self.get_approximate_size_with_options(range, SizeApproximationOptions::default())
+            .await
     }
 
     /// Scan all keys that share the provided prefix using the default scan options.
@@ -5882,6 +6000,118 @@ mod tests {
         // This should definitely not overlap since it's before the first key
         let size = db.get_approximate_size("aaa".."aab").await.unwrap();
         assert_eq!(size, 0, "Expected zero size for range before all data");
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_approximate_sizes_options() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_approx_size_options", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write data - it will be in memtable initially
+        for i in 0..100 {
+            let key = format!("key{:03}", i);
+            let value = vec![0u8; 100];
+            db.put(key.as_bytes(), &value).await.unwrap();
+        }
+
+        // Get sizes with different options
+        let files_options = SizeApproximationOptions {
+            include_memtables: false,
+            include_files: true,
+        };
+        let files_size = db
+            .get_approximate_size_with_options::<&[u8], _>(.., files_options)
+            .await
+            .unwrap();
+
+        let memtable_options = SizeApproximationOptions {
+            include_memtables: true,
+            include_files: false,
+        };
+        let memtable_size = db
+            .get_approximate_size_with_options::<&[u8], _>(.., memtable_options)
+            .await
+            .unwrap();
+
+        // Memtables should have data (we just wrote to them)
+        assert!(
+            memtable_size > 0,
+            "Memtable size should be non-zero after writes"
+        );
+
+        // Combined size should equal sum of parts
+        let both_size = db.get_approximate_size::<&[u8], _>(..).await.unwrap();
+        assert_eq!(
+            both_size,
+            files_size + memtable_size,
+            "Combined size should equal files + memtables"
+        );
+
+        // With neither option, should return 0
+        let neither_options = SizeApproximationOptions {
+            include_memtables: false,
+            include_files: false,
+        };
+        let neither_size = db
+            .get_approximate_size_with_options::<&[u8], _>(.., neither_options)
+            .await
+            .unwrap();
+        assert_eq!(neither_size, 0, "Neither option should return 0");
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_approximate_sizes_options_after_flush() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_approx_size_options_flush", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write data and flush
+        for i in 0..100 {
+            let key = format!("key{:03}", i);
+            let value = vec![0u8; 100];
+            db.put(key.as_bytes(), &value).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        // Get sizes with different options
+        let files_options = SizeApproximationOptions {
+            include_memtables: false,
+            include_files: true,
+        };
+        let files_size = db
+            .get_approximate_size_with_options::<&[u8], _>(.., files_options)
+            .await
+            .unwrap();
+
+        let memtable_options = SizeApproximationOptions {
+            include_memtables: true,
+            include_files: false,
+        };
+        let memtable_size = db
+            .get_approximate_size_with_options::<&[u8], _>(.., memtable_options)
+            .await
+            .unwrap();
+
+        // After flush, data should be either in files or immutable memtables (or both)
+        // The total should be the same regardless of where the data is
+        let both_size = db.get_approximate_size::<&[u8], _>(..).await.unwrap();
+        assert!(both_size > 0, "Should have non-zero size after flush");
+        assert_eq!(
+            both_size,
+            files_size + memtable_size,
+            "Combined size should equal files + memtables"
+        );
 
         db.close().await.unwrap();
     }

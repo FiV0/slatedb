@@ -312,6 +312,18 @@ impl KVTable {
         iterator
     }
 
+    /// Estimate the size of entries in the given key range.
+    ///
+    /// Iterates through all entries in the range and sums their estimated sizes.
+    pub(crate) fn estimate_range_size<T: RangeBounds<Bytes>>(&self, range: T) -> u64 {
+        let mut iter = self.range_ascending(range);
+        let mut total_size = 0u64;
+        while let Some(entry) = iter.next_entry_sync() {
+            total_size += entry.estimated_size() as u64;
+        }
+        total_size
+    }
+
     pub(crate) fn put(&self, row: RowEntry) {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);

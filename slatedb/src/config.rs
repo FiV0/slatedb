@@ -523,6 +523,27 @@ pub struct CheckpointOptions {
     pub name: Option<String>,
 }
 
+/// Options for approximate size estimation.
+///
+/// Controls which data sources are included when estimating the size of key ranges.
+/// By default, both memtables and SST files are included.
+#[derive(Clone, Debug)]
+pub struct SizeApproximationOptions {
+    /// Include size from in-memory memtables (current and immutable).
+    pub include_memtables: bool,
+    /// Include size from on-disk SST files (L0 and compacted).
+    pub include_files: bool,
+}
+
+impl Default for SizeApproximationOptions {
+    fn default() -> Self {
+        Self {
+            include_memtables: true,
+            include_files: true,
+        }
+    }
+}
+
 /// Settings represents the configuration options that a user can tweak to customize
 /// the database engine to their use case.
 ///
