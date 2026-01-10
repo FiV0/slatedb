@@ -20,6 +20,7 @@
 //! }
 //! ```
 
+use std::ops::Bound::Unbounded;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
@@ -206,6 +207,41 @@ impl DbInner {
         self.reader
             .scan_with_options(range, options, &db_state, None, None, None)
             .await
+    }
+
+    /// Get approximate sizes in bytes for the given key ranges.
+    ///
+    /// Returns the estimated size of data in SST files that overlap with each
+    /// provided range. This only includes on-disk SST files, not memtables.
+    pub(crate) fn get_approximate_sizes(
+        &self,
+        ranges: &[BytesRange],
+    ) -> Result<Vec<u64>, SlateDBError> {
+        self.check_closed()?;
+        let db_state = self.state.read().view();
+        let core = db_state.state.core();
+
+        Ok(ranges
+            .iter()
+            .map(|range| {
+                // L0 SSTs (check all, they may overlap)
+                let l0_size: u64 = core
+                    .l0
+                    .iter()
+                    .filter(|sst| sst.intersects_range(Unbounded, range))
+                    .map(|sst| sst.estimate_size())
+                    .sum();
+
+                // Compacted sorted runs
+                let compacted_size: u64 = core
+                    .compacted
+                    .iter()
+                    .map(|sr| sr.estimate_range_size(range))
+                    .sum();
+
+                l0_size + compacted_size
+            })
+            .collect())
     }
 
     /// Fences all writers with an older epoch than the provided `manifest` by flushing
@@ -901,6 +937,101 @@ impl Db {
             .scan_with_options(BytesRange::from(range), options)
             .await
             .map_err(Into::into)
+    }
+
+    /// Get approximate sizes in bytes for the given key ranges.
+    ///
+    /// Returns the estimated size of data in SST files that overlap with each
+    /// provided range. This is useful for understanding data distribution and
+    /// planning operations like bulk exports.
+    ///
+    /// Note: This only includes on-disk SST files, not in-memory memtables.
+    /// The sizes are approximate because partial SST overlaps are counted as
+    /// full SST sizes.
+    ///
+    /// ## Arguments
+    /// - `ranges`: An iterator of key ranges to estimate sizes for
+    ///
+    /// ## Returns
+    /// - `Vec<u64>`: A vector of approximate sizes in bytes, one for each input range
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use slatedb::{Db, Error};
+    /// use slatedb::object_store::memory::InMemory;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let object_store = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///
+    ///     let ranges = vec!["a".."m", "m".."z"];
+    ///     let sizes = db.get_approximate_sizes(ranges).await?;
+    ///     println!("Range a..m: {} bytes", sizes[0]);
+    ///     println!("Range m..z: {} bytes", sizes[1]);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn get_approximate_sizes<K, T, I>(&self, ranges: I) -> Result<Vec<u64>, crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+        I: IntoIterator<Item = T> + Send,
+    {
+        let bytes_ranges: Vec<BytesRange> = ranges
+            .into_iter()
+            .map(|range| {
+                let start = range
+                    .start_bound()
+                    .map(|b| Bytes::copy_from_slice(b.as_ref()));
+                let end = range
+                    .end_bound()
+                    .map(|b| Bytes::copy_from_slice(b.as_ref()));
+                BytesRange::from((start, end))
+            })
+            .collect();
+        self.inner
+            .get_approximate_sizes(&bytes_ranges)
+            .map_err(Into::into)
+    }
+
+    /// Get approximate size in bytes for a single key range.
+    ///
+    /// This is a convenience method for getting the size of a single range.
+    /// See [`get_approximate_sizes`](Self::get_approximate_sizes) for more details.
+    ///
+    /// ## Arguments
+    /// - `range`: The key range to estimate the size for
+    ///
+    /// ## Returns
+    /// - `u64`: The approximate size in bytes
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use slatedb::{Db, Error};
+    /// use slatedb::object_store::memory::InMemory;
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let object_store = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///
+    ///     let size = db.get_approximate_size("a".."z").await?;
+    ///     println!("Range a..z: {} bytes", size);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn get_approximate_size<K, T>(&self, range: T) -> Result<u64, crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+    {
+        let sizes = self.get_approximate_sizes([range]).await?;
+        Ok(sizes.into_iter().next().unwrap_or(0))
     }
 
     /// Scan all keys that share the provided prefix using the default scan options.
@@ -5654,5 +5785,104 @@ mod tests {
         );
 
         db.close().await.expect("failed to close DB");
+    }
+
+    #[tokio::test]
+    async fn test_get_approximate_sizes_empty_db() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_approx_size_empty", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        let sizes = db.get_approximate_sizes(vec!["a".."z"]).await.unwrap();
+        assert_eq!(sizes, vec![0]);
+
+        let size = db.get_approximate_size("a".."z").await.unwrap();
+        assert_eq!(size, 0);
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_approximate_sizes_with_data() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_approx_size_data", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write enough data to create SSTs
+        for i in 0..100 {
+            let key = format!("key{:03}", i);
+            let value = vec![0u8; 100];
+            db.put(key.as_bytes(), &value).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        // Full range should have non-zero size
+        let full_size = db.get_approximate_size::<&[u8], _>(..).await.unwrap();
+        assert!(full_size > 0, "Expected non-zero size for full range");
+
+        // Partial range should also work
+        let partial_size = db.get_approximate_size("key000".."key050").await.unwrap();
+        assert!(
+            partial_size > 0,
+            "Expected non-zero size for partial range"
+        );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_approximate_sizes_multiple_ranges() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_approx_size_multi", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write data
+        for i in 0..100 {
+            let key = format!("key{:03}", i);
+            let value = vec![0u8; 100];
+            db.put(key.as_bytes(), &value).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        // Query multiple ranges at once
+        let ranges = vec!["key000".."key025", "key025".."key050", "key050".."key100"];
+        let sizes = db.get_approximate_sizes(ranges).await.unwrap();
+        assert_eq!(sizes.len(), 3);
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_approximate_sizes_no_overlap() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_approx_size_no_overlap", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        // Write data in range key000-key099
+        for i in 0..100 {
+            let key = format!("key{:03}", i);
+            let value = vec![0u8; 100];
+            db.put(key.as_bytes(), &value).await.unwrap();
+        }
+        db.flush().await.unwrap();
+
+        // Query a range that comes BEFORE any data (SST first_key is "key000")
+        // This should definitely not overlap since it's before the first key
+        let size = db.get_approximate_size("aaa".."aab").await.unwrap();
+        assert_eq!(size, 0, "Expected zero size for range before all data");
+
+        db.close().await.unwrap();
     }
 }

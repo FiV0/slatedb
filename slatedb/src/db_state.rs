@@ -243,6 +243,14 @@ impl SortedRun {
         self.ssts.iter().map(|sst| sst.estimate_size()).sum()
     }
 
+    /// Estimate the size of SSTs covering the given range.
+    pub(crate) fn estimate_range_size(&self, range: &BytesRange) -> u64 {
+        self.tables_covering_range(range)
+            .iter()
+            .map(|sst| sst.estimate_size())
+            .sum()
+    }
+
     pub(crate) fn find_sst_with_range_covering_key_idx(&self, key: &[u8]) -> Option<usize> {
         // returns the sst after the one whose range includes the key
         let first_sst = self
