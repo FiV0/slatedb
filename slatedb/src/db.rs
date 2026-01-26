@@ -1463,6 +1463,90 @@ impl Db {
         Ok(txn)
     }
 
+    /// Get an approximate size (in bytes) of the data in the specified range.
+    ///
+    /// This is a stub implementation that returns a constant value.
+    ///
+    /// ## Arguments
+    /// - `range`: the key range to estimate the size for
+    ///
+    /// ## Returns
+    /// - `Result<u64, crate::Error>`: the approximate size in bytes
+    ///
+    /// ## Example
+    /// ```no_run
+    /// # use slatedb::db::Db;
+    /// # use object_store::memory::InMemory;
+    /// # use std::sync::Arc;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let object_store = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///     let size = db.get_approximate_size(b"key1"..b"key9").await?;
+    ///     println!("Approximate size: {} bytes", size);
+    ///     Ok(())
+    /// # }
+    /// ```
+    pub async fn get_approximate_size<K, T>(&self, range: T) -> Result<u64, crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+    {
+        // Convert range to BytesRange (same pattern as scan_with_options)
+        let start = range
+            .start_bound()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        let end = range
+            .end_bound()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        let _range = BytesRange::from((start, end));
+
+        // Stub implementation - always returns 100
+        Ok(100)
+    }
+
+    /// Estimate the number of keys in the specified range.
+    ///
+    /// This is a stub implementation that returns a constant value.
+    ///
+    /// ## Arguments
+    /// - `range`: the key range to estimate the key count for
+    ///
+    /// ## Returns
+    /// - `Result<u64, crate::Error>`: the estimated number of keys
+    ///
+    /// ## Example
+    /// ```no_run
+    /// # use slatedb::db::Db;
+    /// # use object_store::memory::InMemory;
+    /// # use std::sync::Arc;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let object_store = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///     let count = db.estimate_key_count(b"key1"..b"key9").await?;
+    ///     println!("Estimated key count: {}", count);
+    ///     Ok(())
+    /// # }
+    /// ```
+    pub async fn estimate_key_count<K, T>(&self, range: T) -> Result<u64, crate::Error>
+    where
+        K: AsRef<[u8]> + Send,
+        T: RangeBounds<K> + Send,
+    {
+        // Convert range to BytesRange (same pattern as scan_with_options)
+        let start = range
+            .start_bound()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        let end = range
+            .end_bound()
+            .map(|b| Bytes::copy_from_slice(b.as_ref()));
+        let _range = BytesRange::from((start, end));
+
+        // Stub implementation - always returns 10
+        Ok(10)
+    }
+
     /// Resolve an object store from a URL.
     ///
     /// ## Arguments
