@@ -302,7 +302,7 @@ impl TokioCompactionExecutorInner {
             StoredManifest::load(self.manifest_store.clone(), self.clock.clone()).await?;
         let mut retention_iter = RetentionIterator::new(
             merge_iter,
-            None,
+            Some(std::time::Duration::from_secs(24 * 60 * 60)),
             job_args.retention_min_seq,
             job_args.is_dest_last_run,
             job_args.compaction_clock_tick,
