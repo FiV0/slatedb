@@ -731,6 +731,34 @@ impl Db {
         Ok(snapshot)
     }
 
+    /// Create a snapshot of the database at a specific sequence number.
+    ///
+    /// ## Arguments
+    /// - `seq`: the sequence number to create the snapshot at. Must not exceed
+    ///   the current [`last_committed_seq`](Self::last_committed_seq).
+    ///
+    /// ## Returns
+    /// - `Result<Arc<DbSnapshot>, Error>`: a snapshot pinned to the given sequence number.
+    ///
+    /// ## Errors
+    /// - Returns [`ErrorKind::Invalid`] if `seq` is beyond `last_committed_seq`.
+    pub async fn snapshot_as_of(&self, seq: u64) -> Result<Arc<DbSnapshot>, crate::Error> {
+        self.inner.check_closed()?;
+        let current_seq = self.inner.oracle.last_committed_seq();
+        if seq > current_seq {
+            return Err(crate::Error::invalid(format!(
+                "requested snapshot sequence {seq} is beyond last committed sequence {current_seq}"
+            )));
+        }
+        let snapshot = DbSnapshot::new(self.inner.clone(), self.inner.txn_manager.clone(), seq);
+        Ok(snapshot)
+    }
+
+    /// Returns the sequence number of the most recent committed write.
+    pub fn last_committed_seq(&self) -> u64 {
+        self.inner.oracle.last_committed_seq()
+    }
+
     /// Get a value from the database with default read options.
     ///
     /// The `Bytes` object returned contains a slice of an entire

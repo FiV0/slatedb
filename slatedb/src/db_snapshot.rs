@@ -734,4 +734,50 @@ mod tests {
         assert_eq!(db_result, Some(Bytes::from("value2")));
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_snapshot_as_of_basic() -> Result<(), Error> {
+        let db = create_test_db().await;
+
+        db.put(b"key1", b"value1").await?;
+        let seq = db.last_committed_seq();
+
+        db.put(b"key2", b"value2").await?;
+        db.put(b"key1", b"value1_updated").await?;
+
+        let snapshot = db.snapshot_as_of(seq).await?;
+
+        assert_eq!(
+            snapshot.get(b"key1").await?,
+            Some(Bytes::from("value1")),
+        );
+        assert_eq!(snapshot.get(b"key2").await?, None);
+
+        // Current db sees all writes
+        assert_eq!(
+            db.get(b"key1").await?,
+            Some(Bytes::from("value1_updated")),
+        );
+        assert_eq!(
+            db.get(b"key2").await?,
+            Some(Bytes::from("value2")),
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_as_of_future_seq_errors() -> Result<(), Error> {
+        let db = create_test_db().await;
+
+        db.put(b"key1", b"value1").await?;
+        let seq = db.last_committed_seq();
+
+        match db.snapshot_as_of(seq + 1).await {
+            Err(err) => assert_eq!(err.kind(), crate::ErrorKind::Invalid),
+            Ok(_) => panic!("snapshot_as_of with future seq should fail"),
+        }
+
+        Ok(())
+    }
 }
