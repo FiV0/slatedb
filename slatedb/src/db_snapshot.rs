@@ -16,7 +16,7 @@ pub struct DbSnapshot {
     /// txn_id is the id of the transaction that created this snapshot
     txn_id: Uuid,
     /// txn_seq is the sequence number of the transaction that created this snapshot
-    started_seq: u64,
+    pub started_seq: u64,
     /// Reference to the transaction manager that created this snapshot
     txn_manager: Arc<TransactionManager>,
     /// Reference to the database
