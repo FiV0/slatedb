@@ -36,6 +36,7 @@ use tracing::instrument;
 
 use crate::config::WriteOptions;
 use crate::dispatcher::MessageHandler;
+use crate::mem_table::KVTableStatsDelta;
 use crate::types::RowEntry;
 use crate::utils::WatchableOnceCellReader;
 use crate::{batch::WriteBatch, db::DbInner, db::WriteHandle, error::SlateDBError};
@@ -217,7 +218,16 @@ impl DbInner {
     ) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
         let guard = self.state.read();
         let memtable = guard.memtable();
-        entries.into_iter().for_each(|entry| memtable.put(entry));
+        let mut stats_delta = KVTableStatsDelta::default();
+        for entry in entries {
+            let delta = memtable.put(entry);
+            stats_delta.num_puts += delta.num_puts;
+            stats_delta.num_deletes += delta.num_deletes;
+            stats_delta.num_merges += delta.num_merges;
+            stats_delta.raw_key_bytes += delta.raw_key_bytes;
+            stats_delta.raw_value_bytes += delta.raw_value_bytes;
+        }
+        self.db_stats.record_memtable_stats_delta(stats_delta);
         memtable.table().durable_watcher()
     }
 

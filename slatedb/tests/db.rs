@@ -14,6 +14,7 @@ use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::ObjectStore;
 use slatedb::size_tiered_compaction::SizeTieredCompactionSchedulerSupplier;
 use slatedb::{CompactorBuilder, Db};
+use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -74,13 +75,34 @@ async fn test_replay_wal_then_write() {
 
     // Reopen with L0 flush paused so replayed immutable memtables stay queued.
     fail_parallel::cfg(fp_registry.clone(), "flush-memtable-to-l0", "pause").unwrap();
+    let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
 
     let db = Db::builder(path, object_store.clone())
         .with_settings(settings)
         .with_fp_registry(fp_registry.clone())
+        .with_metrics_recorder(metrics_recorder.clone())
         .build()
         .await
         .expect("failed to reopen db");
+
+    let replayed_memtable_puts =
+        lookup_metric(&metrics_recorder, slatedb::db_stats::MEMTABLE_NUM_PUTS)
+            .expect("memtable puts metric should be registered");
+    assert!(
+        replayed_memtable_puts > 0,
+        "expected replayed unflushed memtable puts"
+    );
+    assert_eq!(
+        lookup_metric(&metrics_recorder, slatedb::db_stats::MEMTABLE_RAW_KEY_BYTES),
+        Some(replayed_memtable_puts * 7)
+    );
+    assert_eq!(
+        lookup_metric(
+            &metrics_recorder,
+            slatedb::db_stats::MEMTABLE_RAW_VALUE_BYTES
+        ),
+        Some(replayed_memtable_puts * 9)
+    );
 
     // Write after replay — previously underflowed in maybe_freeze_memtable.
     db.put_with_options(
