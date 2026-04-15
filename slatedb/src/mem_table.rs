@@ -132,22 +132,6 @@ pub(crate) struct KVTableStats {
     pub(crate) raw_value_bytes: u64,
 }
 
-impl KVTableStats {
-    fn from_row(row: &RowEntry) -> Self {
-        let mut stats = Self {
-            raw_key_bytes: row.key.len() as u64,
-            raw_value_bytes: row.value.len() as u64,
-            ..Self::default()
-        };
-        match &row.value {
-            ValueDeletable::Value(_) => stats.num_puts = 1,
-            ValueDeletable::Tombstone => stats.num_deletes = 1,
-            ValueDeletable::Merge(_) => stats.num_merges = 1,
-        }
-        stats
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct KVTableStatsDelta {
     pub(crate) num_puts: i64,
@@ -174,6 +158,32 @@ impl KVTableStatsDelta {
         self.num_merges -= stats.num_merges as i64;
         self.raw_key_bytes -= stats.raw_key_bytes as i64;
         self.raw_value_bytes -= stats.raw_value_bytes as i64;
+    }
+
+    fn add_delta(&mut self, other: Self) {
+        self.num_puts += other.num_puts;
+        self.num_deletes += other.num_deletes;
+        self.num_merges += other.num_merges;
+        self.raw_key_bytes += other.raw_key_bytes;
+        self.raw_value_bytes += other.raw_value_bytes;
+    }
+
+    fn add_row(&mut self, row: &RowEntry) {
+        self.apply_row(row, 1);
+    }
+
+    fn subtract_row(&mut self, row: &RowEntry) {
+        self.apply_row(row, -1);
+    }
+
+    fn apply_row(&mut self, row: &RowEntry, sign: i64) {
+        match &row.value {
+            ValueDeletable::Value(_) => self.num_puts += sign,
+            ValueDeletable::Tombstone => self.num_deletes += sign,
+            ValueDeletable::Merge(_) => self.num_merges += sign,
+        }
+        self.raw_key_bytes += sign * row.key.len() as i64;
+        self.raw_value_bytes += sign * row.value.len() as i64;
     }
 }
 
@@ -478,7 +488,7 @@ impl KVTable {
     pub(crate) fn put(&self, row: RowEntry) -> KVTableStatsDelta {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
-        let previous_stats = Cell::new(None);
+        let previous_stats_delta = Cell::new(KVTableStatsDelta::default());
 
         // it is safe to use fetch_max here to update the last tick
         // because the monotonicity is enforced when generating the clock tick
@@ -493,17 +503,20 @@ impl KVTable {
         self.first_seq.fetch_min(row.seq, atomic::Ordering::SeqCst);
 
         let row_size = row.estimated_size();
-        let row_stats = KVTableStats::from_row(&row);
+        let mut inserted_stats_delta = KVTableStatsDelta::default();
+        inserted_stats_delta.add_row(&row);
         self.map.compare_insert(internal_key, row, |previous_row| {
             // Optimistically calculate the size of the previous value.
             // `compare_fn` might be called multiple times in case of concurrent
             // writes to the same key, so we use `Cell` to avoid subtracting
             // the size multiple times. The last call will set the correct size.
             previous_size.set(Some(previous_row.estimated_size()));
-            previous_stats.set(Some(KVTableStats::from_row(previous_row)));
+            let mut delta = KVTableStatsDelta::default();
+            delta.subtract_row(previous_row);
+            previous_stats_delta.set(delta);
             true
         });
-        let mut stats_delta = KVTableStatsDelta::from_stats(row_stats);
+        let mut stats_delta = previous_stats_delta.get();
         if let Some(size) = previous_size.take() {
             self.entries_size_in_bytes
                 .fetch_sub(size, Ordering::Relaxed);
@@ -513,36 +526,25 @@ impl KVTable {
             self.entries_size_in_bytes
                 .fetch_add(row_size, Ordering::Relaxed);
         }
-        if let Some(stats) = previous_stats.take() {
-            self.sub_stats(stats);
-            stats_delta.sub_stats(stats);
-        }
-        self.add_stats(row_stats);
+        stats_delta.add_delta(inserted_stats_delta);
+        self.apply_stats_delta(stats_delta);
         stats_delta
     }
 
-    fn add_stats(&self, stats: KVTableStats) {
-        self.num_puts.fetch_add(stats.num_puts, Ordering::Relaxed);
-        self.num_deletes
-            .fetch_add(stats.num_deletes, Ordering::Relaxed);
-        self.num_merges
-            .fetch_add(stats.num_merges, Ordering::Relaxed);
-        self.raw_key_bytes
-            .fetch_add(stats.raw_key_bytes, Ordering::Relaxed);
-        self.raw_value_bytes
-            .fetch_add(stats.raw_value_bytes, Ordering::Relaxed);
-    }
+    fn apply_stats_delta(&self, delta: KVTableStatsDelta) {
+        fn apply(atomic: &AtomicU64, delta: i64) {
+            if delta >= 0 {
+                atomic.fetch_add(delta as u64, Ordering::Relaxed);
+            } else {
+                atomic.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+            }
+        }
 
-    fn sub_stats(&self, stats: KVTableStats) {
-        self.num_puts.fetch_sub(stats.num_puts, Ordering::Relaxed);
-        self.num_deletes
-            .fetch_sub(stats.num_deletes, Ordering::Relaxed);
-        self.num_merges
-            .fetch_sub(stats.num_merges, Ordering::Relaxed);
-        self.raw_key_bytes
-            .fetch_sub(stats.raw_key_bytes, Ordering::Relaxed);
-        self.raw_value_bytes
-            .fetch_sub(stats.raw_value_bytes, Ordering::Relaxed);
+        apply(&self.num_puts, delta.num_puts);
+        apply(&self.num_deletes, delta.num_deletes);
+        apply(&self.num_merges, delta.num_merges);
+        apply(&self.raw_key_bytes, delta.raw_key_bytes);
+        apply(&self.raw_value_bytes, delta.raw_value_bytes);
     }
 
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
