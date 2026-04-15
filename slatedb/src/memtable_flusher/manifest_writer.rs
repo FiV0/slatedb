@@ -23,6 +23,7 @@ use crate::db_state::SsTableView;
 use crate::dispatcher::MessageHandler;
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
+use crate::mem_table::KVTableStatsDelta;
 use crate::oracle::Oracle;
 use crate::utils::IdGenerator;
 use crate::utils::SafeSender;
@@ -381,6 +382,12 @@ impl ManifestWriterHandler {
         through_seq: u64,
     ) -> Result<(), SlateDBError> {
         self.apply_uploaded_state(&staged_batch)?;
+        let mut stats_delta = KVTableStatsDelta::default();
+        for uploaded in &staged_batch {
+            let stats = uploaded.imm_memtable.table().metadata().stats;
+            stats_delta.sub_stats(stats);
+        }
+        self.db.db_stats.record_memtable_stats_delta(stats_delta);
 
         for uploaded in &staged_batch {
             uploaded.imm_memtable.notify_uploaded(Ok(()));

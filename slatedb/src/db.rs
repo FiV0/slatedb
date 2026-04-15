@@ -59,7 +59,7 @@ use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
 use crate::manifest::store::FenceableManifest;
 use crate::manifest::{Manifest, ManifestCore};
-use crate::mem_table::WritableKVTable;
+use crate::mem_table::{KVTableStatsDelta, WritableKVTable};
 use crate::memtable_flusher::{FlushResult, FlushTarget, MemtableFlusher};
 use crate::merge_operator::{instrument_merge_operator, MergeOperatorType};
 use crate::oracle::{DbOracle, Oracle};
@@ -548,7 +548,9 @@ impl DbInner {
             assert!(self.oracle.last_remote_persisted_seq() <= replayed_table.last_seq);
             self.oracle.advance_durable_seq(replayed_table.last_seq);
             self.maybe_apply_backpressure().await?;
+            let stats_delta = KVTableStatsDelta::from_stats(replayed_table.table.metadata().stats);
             self.replay_memtable(replayed_table)?;
+            self.db_stats.record_memtable_stats_delta(stats_delta);
         }
 
         Ok(())
@@ -7452,6 +7454,104 @@ mod tests {
         assert!(
             lookup_merge_operator_operands(&metrics_recorder, MERGE_OPERATOR_COMPACT_PATH)
                 .is_none_or(|value| value == 0)
+        );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_should_record_global_memtable_stats() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let mut opts = test_db_options(0, 1024, None);
+        opts.flush_interval = None;
+        opts.max_unflushed_bytes = 1024 * 1024;
+        let db = Db::builder(
+            "/tmp/test_should_record_global_memtable_stats",
+            object_store,
+        )
+        .with_settings(opts)
+        .with_metrics_recorder(metrics_recorder.clone())
+        .with_merge_operator(Arc::new(StringConcatMergeOperator))
+        .build()
+        .await
+        .unwrap();
+
+        db.put_with_options(
+            b"k1",
+            b"v1",
+            &PutOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.delete_with_options(
+            b"k2",
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+        db.merge_with_options(
+            b"k3",
+            b"m3",
+            &MergeOptions::default(),
+            &WriteOptions {
+                await_durable: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_NUM_PUTS),
+            Some(1)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_NUM_DELETES),
+            Some(1)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_NUM_MERGES),
+            Some(1)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_RAW_KEY_BYTES),
+            Some(6)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_RAW_VALUE_BYTES),
+            Some(4)
+        );
+
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_NUM_PUTS),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_NUM_DELETES),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_NUM_MERGES),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_RAW_KEY_BYTES),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::MEMTABLE_RAW_VALUE_BYTES),
+            Some(0)
         );
 
         db.close().await.unwrap();

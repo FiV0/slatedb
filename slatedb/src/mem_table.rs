@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use crate::error::SlateDBError;
 use crate::iter::{IterationOrder, RowEntryIterator};
 use crate::seq_tracker::{SequenceTracker, TrackedSeq};
-use crate::types::RowEntry;
+use crate::types::{RowEntry, ValueDeletable};
 use crate::utils::{WatchableOnceCell, WatchableOnceCellReader};
 
 /// Memtable may contains multiple versions of a single user key, with a monotonically increasing sequence number.
@@ -92,6 +92,11 @@ pub(crate) struct KVTable {
     map: Arc<SkipMap<SequencedKey, RowEntry>>,
     durable: WatchableOnceCell<Result<(), SlateDBError>>,
     entries_size_in_bytes: AtomicUsize,
+    num_puts: AtomicU64,
+    num_deletes: AtomicU64,
+    num_merges: AtomicU64,
+    raw_key_bytes: AtomicU64,
+    raw_value_bytes: AtomicU64,
     /// this corresponds to the timestamp of the most recent
     /// modifying operation on this KVTable (insertion or deletion)
     last_tick: AtomicI64,
@@ -107,6 +112,7 @@ pub(crate) struct KVTable {
 pub(crate) struct KVTableMetadata {
     pub(crate) entry_num: usize,
     pub(crate) entries_size_in_bytes: usize,
+    pub(crate) stats: KVTableStats,
     /// this corresponds to the timestamp of the most recent
     /// modifying operation on this KVTable (insertion or deletion)
     #[allow(dead_code)]
@@ -115,6 +121,70 @@ pub(crate) struct KVTableMetadata {
     pub(crate) last_seq: u64,
     /// the sequence number of the oldest entry in this KVTable
     pub(crate) first_seq: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KVTableStats {
+    pub(crate) num_puts: u64,
+    pub(crate) num_deletes: u64,
+    pub(crate) num_merges: u64,
+    pub(crate) raw_key_bytes: u64,
+    pub(crate) raw_value_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KVTableStatsDelta {
+    pub(crate) num_puts: i64,
+    pub(crate) num_deletes: i64,
+    pub(crate) num_merges: i64,
+    pub(crate) raw_key_bytes: i64,
+    pub(crate) raw_value_bytes: i64,
+}
+
+impl KVTableStatsDelta {
+    pub(crate) fn from_stats(stats: KVTableStats) -> Self {
+        Self {
+            num_puts: stats.num_puts as i64,
+            num_deletes: stats.num_deletes as i64,
+            num_merges: stats.num_merges as i64,
+            raw_key_bytes: stats.raw_key_bytes as i64,
+            raw_value_bytes: stats.raw_value_bytes as i64,
+        }
+    }
+
+    pub(crate) fn sub_stats(&mut self, stats: KVTableStats) {
+        self.num_puts -= stats.num_puts as i64;
+        self.num_deletes -= stats.num_deletes as i64;
+        self.num_merges -= stats.num_merges as i64;
+        self.raw_key_bytes -= stats.raw_key_bytes as i64;
+        self.raw_value_bytes -= stats.raw_value_bytes as i64;
+    }
+
+    fn add_delta(&mut self, other: Self) {
+        self.num_puts += other.num_puts;
+        self.num_deletes += other.num_deletes;
+        self.num_merges += other.num_merges;
+        self.raw_key_bytes += other.raw_key_bytes;
+        self.raw_value_bytes += other.raw_value_bytes;
+    }
+
+    fn add_row(&mut self, row: &RowEntry) {
+        self.apply_row(row, 1);
+    }
+
+    fn subtract_row(&mut self, row: &RowEntry) {
+        self.apply_row(row, -1);
+    }
+
+    fn apply_row(&mut self, row: &RowEntry, sign: i64) {
+        match &row.value {
+            ValueDeletable::Value(_) => self.num_puts += sign,
+            ValueDeletable::Tombstone => self.num_deletes += sign,
+            ValueDeletable::Merge(_) => self.num_merges += sign,
+        }
+        self.raw_key_bytes += sign * row.key.len() as i64;
+        self.raw_value_bytes += sign * row.value.len() as i64;
+    }
 }
 
 pub(crate) struct WritableKVTable {
@@ -132,8 +202,8 @@ impl WritableKVTable {
         &self.table
     }
 
-    pub(crate) fn put(&self, row: RowEntry) {
-        self.table.put(row);
+    pub(crate) fn put(&self, row: RowEntry) -> KVTableStatsDelta {
+        self.table.put(row)
     }
 
     pub(crate) fn metadata(&self) -> KVTableMetadata {
@@ -327,6 +397,11 @@ impl KVTable {
         Self {
             map: Arc::new(SkipMap::new()),
             entries_size_in_bytes: AtomicUsize::new(0),
+            num_puts: AtomicU64::new(0),
+            num_deletes: AtomicU64::new(0),
+            num_merges: AtomicU64::new(0),
+            raw_key_bytes: AtomicU64::new(0),
+            raw_value_bytes: AtomicU64::new(0),
             durable: WatchableOnceCell::new(),
             last_tick: AtomicI64::new(i64::MIN),
             last_seq: AtomicU64::new(0),
@@ -338,12 +413,20 @@ impl KVTable {
     pub(crate) fn metadata(&self) -> KVTableMetadata {
         let entry_num = self.map.len();
         let entries_size_in_bytes = self.entries_size_in_bytes.load(Ordering::Relaxed);
+        let stats = KVTableStats {
+            num_puts: self.num_puts.load(Ordering::Relaxed),
+            num_deletes: self.num_deletes.load(Ordering::Relaxed),
+            num_merges: self.num_merges.load(Ordering::Relaxed),
+            raw_key_bytes: self.raw_key_bytes.load(Ordering::Relaxed),
+            raw_value_bytes: self.raw_value_bytes.load(Ordering::Relaxed),
+        };
         let last_tick = self.last_tick.load(SeqCst);
         let last_seq = self.last_seq().unwrap_or(0);
         let first_seq = self.first_seq().unwrap_or(0);
         KVTableMetadata {
             entry_num,
             entries_size_in_bytes,
+            stats,
             last_tick,
             last_seq,
             first_seq,
@@ -402,9 +485,10 @@ impl KVTable {
         iterator
     }
 
-    pub(crate) fn put(&self, row: RowEntry) {
+    pub(crate) fn put(&self, row: RowEntry) -> KVTableStatsDelta {
         let internal_key = SequencedKey::new(row.key.clone(), row.seq);
         let previous_size = Cell::new(None);
+        let previous_stats_delta = Cell::new(KVTableStatsDelta::default());
 
         // it is safe to use fetch_max here to update the last tick
         // because the monotonicity is enforced when generating the clock tick
@@ -419,14 +503,20 @@ impl KVTable {
         self.first_seq.fetch_min(row.seq, atomic::Ordering::SeqCst);
 
         let row_size = row.estimated_size();
+        let mut inserted_stats_delta = KVTableStatsDelta::default();
+        inserted_stats_delta.add_row(&row);
         self.map.compare_insert(internal_key, row, |previous_row| {
             // Optimistically calculate the size of the previous value.
             // `compare_fn` might be called multiple times in case of concurrent
             // writes to the same key, so we use `Cell` to avoid subtracting
             // the size multiple times. The last call will set the correct size.
             previous_size.set(Some(previous_row.estimated_size()));
+            let mut delta = KVTableStatsDelta::default();
+            delta.subtract_row(previous_row);
+            previous_stats_delta.set(delta);
             true
         });
+        let mut stats_delta = previous_stats_delta.get();
         if let Some(size) = previous_size.take() {
             self.entries_size_in_bytes
                 .fetch_sub(size, Ordering::Relaxed);
@@ -436,6 +526,25 @@ impl KVTable {
             self.entries_size_in_bytes
                 .fetch_add(row_size, Ordering::Relaxed);
         }
+        stats_delta.add_delta(inserted_stats_delta);
+        self.apply_stats_delta(stats_delta);
+        stats_delta
+    }
+
+    fn apply_stats_delta(&self, delta: KVTableStatsDelta) {
+        fn apply(atomic: &AtomicU64, delta: i64) {
+            if delta >= 0 {
+                atomic.fetch_add(delta as u64, Ordering::Relaxed);
+            } else {
+                atomic.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+            }
+        }
+
+        apply(&self.num_puts, delta.num_puts);
+        apply(&self.num_deletes, delta.num_deletes);
+        apply(&self.num_merges, delta.num_merges);
+        apply(&self.raw_key_bytes, delta.raw_key_bytes);
+        apply(&self.raw_value_bytes, delta.raw_value_bytes);
     }
 
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
@@ -583,15 +692,36 @@ mod tests {
 
         assert_eq!(metadata.entry_num, 0);
         assert_eq!(metadata.entries_size_in_bytes, 0);
+        assert_eq!(metadata.stats, KVTableStats::default());
         table.put(RowEntry::new_value(b"first", b"foo", 1));
         metadata = table.table().metadata();
         assert_eq!(metadata.entry_num, 1);
         assert_eq!(metadata.entries_size_in_bytes, 16);
+        assert_eq!(
+            metadata.stats,
+            KVTableStats {
+                num_puts: 1,
+                num_deletes: 0,
+                num_merges: 0,
+                raw_key_bytes: 5,
+                raw_value_bytes: 3,
+            }
+        );
 
         table.put(RowEntry::new_tombstone(b"first", 2));
         metadata = table.table().metadata();
         assert_eq!(metadata.entry_num, 2);
         assert_eq!(metadata.entries_size_in_bytes, 29);
+        assert_eq!(
+            metadata.stats,
+            KVTableStats {
+                num_puts: 1,
+                num_deletes: 1,
+                num_merges: 0,
+                raw_key_bytes: 10,
+                raw_value_bytes: 3,
+            }
+        );
 
         table.put(RowEntry::new_value(b"abc333", b"val1", 1));
         metadata = table.table().metadata();
@@ -612,6 +742,47 @@ mod tests {
         metadata = table.table().metadata();
         assert_eq!(metadata.entry_num, 6);
         assert_eq!(metadata.entries_size_in_bytes, 104);
+        assert_eq!(
+            metadata.stats,
+            KVTableStats {
+                num_puts: 4,
+                num_deletes: 2,
+                num_merges: 0,
+                raw_key_bytes: 34,
+                raw_value_bytes: 22,
+            }
+        );
+
+        table.put(RowEntry::new_merge(b"merge", b"operand", 5));
+        metadata = table.table().metadata();
+        assert_eq!(metadata.entry_num, 7);
+        assert_eq!(metadata.entries_size_in_bytes, 124);
+        assert_eq!(
+            metadata.stats,
+            KVTableStats {
+                num_puts: 4,
+                num_deletes: 2,
+                num_merges: 1,
+                raw_key_bytes: 39,
+                raw_value_bytes: 29,
+            }
+        );
+
+        table.put(RowEntry::new_value(b"same", b"old", 10));
+        table.put(RowEntry::new_tombstone(b"same", 10));
+        metadata = table.table().metadata();
+        assert_eq!(metadata.entry_num, 8);
+        assert_eq!(metadata.entries_size_in_bytes, 136);
+        assert_eq!(
+            metadata.stats,
+            KVTableStats {
+                num_puts: 4,
+                num_deletes: 3,
+                num_merges: 1,
+                raw_key_bytes: 43,
+                raw_value_bytes: 29,
+            }
+        );
     }
 
     #[tokio::test]
