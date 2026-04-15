@@ -385,11 +385,7 @@ impl ManifestWriterHandler {
         let mut stats_delta = KVTableStatsDelta::default();
         for uploaded in &staged_batch {
             let stats = uploaded.imm_memtable.table().metadata().stats;
-            stats_delta.num_puts -= stats.num_puts as i64;
-            stats_delta.num_deletes -= stats.num_deletes as i64;
-            stats_delta.num_merges -= stats.num_merges as i64;
-            stats_delta.raw_key_bytes -= stats.raw_key_bytes as i64;
-            stats_delta.raw_value_bytes -= stats.raw_value_bytes as i64;
+            stats_delta.sub_stats(stats);
         }
         self.db.db_stats.record_memtable_stats_delta(stats_delta);
 

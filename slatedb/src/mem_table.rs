@@ -168,7 +168,7 @@ impl KVTableStatsDelta {
         }
     }
 
-    fn sub_stats(&mut self, stats: KVTableStats) {
+    pub(crate) fn sub_stats(&mut self, stats: KVTableStats) {
         self.num_puts -= stats.num_puts as i64;
         self.num_deletes -= stats.num_deletes as i64;
         self.num_merges -= stats.num_merges as i64;
