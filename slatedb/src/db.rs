@@ -6121,6 +6121,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_fold_batch_local_merges_across_differing_ttls() {
+        // Regression test for a latent bug: when a single batch contains
+        // multiple merges on the same key with *different* TTLs, the older
+        // `WriteBatchIterator` + `MergeOperatorIterator` pipeline split the
+        // fold at the TTL boundary and emitted multiple RowEntries that all
+        // shared the same commit_seq. They collided in the memtable SkipMap,
+        // and the second insert silently overwrote the first — losing an
+        // operand.
+        //
+        // Expected behavior: both operands are applied, so the read produces
+        // "ab". On the pre-fix implementation only one operand survives.
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder(
+            "/tmp/test_fold_batch_local_merges_across_differing_ttls",
+            object_store.clone(),
+        )
+        .with_settings(test_db_options(0, 1024, None))
+        .with_merge_operator(Arc::new(StringConcatMergeOperator))
+        .build()
+        .await
+        .unwrap();
+
+        let mut batch = WriteBatch::new();
+        batch.merge_with_options(
+            b"key1",
+            b"a",
+            &MergeOptions {
+                ttl: Ttl::ExpireAfter(3600),
+            },
+        );
+        batch.merge_with_options(
+            b"key1",
+            b"b",
+            &MergeOptions {
+                ttl: Ttl::ExpireAfter(7200),
+            },
+        );
+        db.write(batch).await.unwrap();
+
+        let result = db.get(b"key1").await.unwrap();
+        assert_eq!(result, Some(Bytes::from("ab")));
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn should_persist_merge_operands_across_flush() {
         // Given: Database with merge operator, merge operands in memtable
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
