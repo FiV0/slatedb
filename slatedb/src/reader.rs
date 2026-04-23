@@ -1,4 +1,4 @@
-use crate::batch::WriteBatchIterator;
+use crate::txn_buffer::TxnBufferIterator;
 use crate::bytes_range::BytesRange;
 use crate::clock::MonotonicClock;
 use crate::config::{DurabilityLevel, ReadOptions, ScanOptions};
@@ -26,7 +26,7 @@ pub(crate) trait DbStateReader {
 }
 
 struct IteratorSources {
-    write_batch_iter: Option<WriteBatchIterator>,
+    write_batch_iter: Option<TxnBufferIterator>,
     mem_iters: Vec<Box<dyn RowEntryIterator + 'static>>,
     l0_iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
     sr_iters: VecDeque<Box<dyn RowEntryIterator + 'static>>,
@@ -109,7 +109,7 @@ impl Reader {
         &self,
         range: &BytesRange,
         db_state: &(dyn DbStateReader + Sync),
-        write_batch_iter: Option<WriteBatchIterator>,
+        write_batch_iter: Option<TxnBufferIterator>,
         sst_iter_options: SstIteratorOptions,
         point_lookup_stats: Option<DbStats>,
     ) -> Result<IteratorSources, SlateDBError> {
@@ -297,7 +297,7 @@ impl Reader {
         key: K,
         options: &ReadOptions,
         db_state: &(dyn DbStateReader + Sync + Send),
-        write_batch_iter: Option<WriteBatchIterator>,
+        write_batch_iter: Option<TxnBufferIterator>,
         max_seq: Option<u64>,
     ) -> Result<Option<KeyValue>, SlateDBError> {
         self.db_stats.get_requests.increment(1);
@@ -376,7 +376,7 @@ impl Reader {
         range: BytesRange,
         options: &ScanOptions,
         db_state: &(dyn DbStateReader + Sync),
-        write_batch_iter: Option<WriteBatchIterator>,
+        write_batch_iter: Option<TxnBufferIterator>,
         max_seq: Option<u64>,
         range_tracker: Option<Arc<DbIteratorRangeTracker>>,
     ) -> Result<DbIterator, SlateDBError> {
@@ -428,14 +428,14 @@ mod tests {
     use rstest::rstest;
     use slatedb_common::clock::{MockSystemClock, SystemClock};
 
-    use crate::batch::WriteBatch;
     use crate::clock::MonotonicClock;
     use crate::iter::IterationOrder;
+    use crate::txn_buffer::TxnBuffer;
 
-    fn wb_point_iter(write_batch: &Option<WriteBatch>, key: &[u8]) -> Option<WriteBatchIterator> {
-        write_batch.as_ref().map(|wb| {
-            WriteBatchIterator::new(
-                wb,
+    fn wb_point_iter(buf: &Option<TxnBuffer>, key: &[u8]) -> Option<TxnBufferIterator> {
+        buf.as_ref().map(|b| {
+            TxnBufferIterator::new(
+                b,
                 BytesRange::from_slice(key..=key),
                 IterationOrder::Ascending,
             )
@@ -443,13 +443,12 @@ mod tests {
     }
 
     fn wb_range_iter(
-        write_batch: &Option<WriteBatch>,
+        buf: &Option<TxnBuffer>,
         range: &BytesRange,
         order: IterationOrder,
-    ) -> Option<WriteBatchIterator> {
-        write_batch
-            .as_ref()
-            .map(|wb| WriteBatchIterator::new(wb, range.clone(), order))
+    ) -> Option<TxnBufferIterator> {
+        buf.as_ref()
+            .map(|b| TxnBufferIterator::new(b, range.clone(), order))
     }
     use crate::db_state::{SortedRun, SsTableHandle, SsTableId};
     use crate::db_status::DbStatusManager;
@@ -465,6 +464,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use ulid::Ulid;
+    use uuid::Uuid;
 
     /// A simple merge operator for testing that concatenates byte strings
     struct StringConcatMergeOperator;
@@ -674,9 +674,9 @@ mod tests {
     async fn populate_db_state(
         test_db_state: &mut TestDbState,
         entries: Vec<TestEntry>,
-    ) -> Result<Option<WriteBatch>, SlateDBError> {
+    ) -> Result<Option<TxnBuffer>, SlateDBError> {
         // Group entries by layer
-        let mut wb_batch: Option<WriteBatch> = None;
+        let mut wb_buf: Option<TxnBuffer> = None;
         let mut mem_entries = Vec::new();
         let mut imm_entries: HashMap<usize, Vec<RowEntry>> = HashMap::new();
         let mut l0_entries: HashMap<usize, Vec<RowEntry>> = HashMap::new();
@@ -686,19 +686,19 @@ mod tests {
             let row_entry = entry.to_row_entry();
             match entry.location {
                 LayerLocation::WriteBatch => {
-                    if wb_batch.is_none() {
-                        wb_batch = Some(WriteBatch::new());
+                    if wb_buf.is_none() {
+                        wb_buf = Some(TxnBuffer::new(Uuid::new_v4()));
                     }
-                    if let Some(ref mut batch) = wb_batch {
+                    if let Some(ref mut buf) = wb_buf {
                         match &entry.value {
                             ValueDeletable::Value(v) => {
-                                batch.put(entry.key, v.as_ref());
+                                buf.put(entry.key, v.as_ref());
                             }
                             ValueDeletable::Tombstone => {
-                                batch.delete(entry.key);
+                                buf.delete(entry.key);
                             }
                             ValueDeletable::Merge(v) => {
-                                batch.merge(entry.key, v.as_ref());
+                                buf.merge(entry.key, v.as_ref());
                             }
                         }
                     }
@@ -751,7 +751,7 @@ mod tests {
             }
         }
 
-        Ok(wb_batch)
+        Ok(wb_buf)
     }
 
     struct LayerPriorityTestCase {

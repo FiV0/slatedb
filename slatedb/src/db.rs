@@ -297,9 +297,9 @@ impl DbInner {
         options: &WriteOptions,
     ) -> Result<WriteHandle, SlateDBError> {
         self.db_stats.write_batch_count.increment(1);
-        self.db_stats.write_ops.increment(batch.ops.len() as u64);
+        self.db_stats.write_ops.increment(batch.total_ops() as u64);
         self.check_closed()?;
-        if batch.ops.is_empty() {
+        if batch.is_empty() {
             return Err(SlateDBError::EmptyBatch);
         }
 
@@ -7551,9 +7551,12 @@ mod tests {
             lookup_merge_operator_operands(&metrics_recorder, MERGE_OPERATOR_READ_PATH),
             Some(0)
         );
+        // Batch-local merge folding now calls `merge_batch` once per user key
+        // with all operands, so the metric reflects the actual operand count
+        // (2) rather than the operand count plus a wrapper call (previously 3).
         assert_eq!(
             lookup_merge_operator_operands(&metrics_recorder, MERGE_OPERATOR_FLUSH_PATH),
-            Some(3)
+            Some(2)
         );
         assert!(
             lookup_merge_operator_operands(&metrics_recorder, MERGE_OPERATOR_COMPACT_PATH)

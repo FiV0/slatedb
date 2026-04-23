@@ -1,4 +1,3 @@
-use crate::batch::WriteBatchIterator;
 use crate::bytes_range::BytesRange;
 use crate::error::SlateDBError;
 use crate::filter_iterator::FilterIterator;
@@ -7,6 +6,7 @@ use crate::merge_iterator::MergeIterator;
 use crate::merge_operator::{
     MergeOperatorIterator, MergeOperatorRequiredIterator, MergeOperatorType,
 };
+use crate::txn_buffer::TxnBufferIterator;
 use crate::types::{KeyValue, RowEntry, ValueDeletable};
 
 use async_trait::async_trait;
@@ -214,7 +214,7 @@ pub struct DbIterator {
 impl DbIterator {
     pub(crate) async fn new(
         range: BytesRange,
-        write_batch_iter: Option<WriteBatchIterator>,
+        write_batch_iter: Option<TxnBufferIterator>,
         mem_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
         l0_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
         sr_iters: impl IntoIterator<Item = Box<dyn RowEntryIterator + 'static>>,
@@ -400,14 +400,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::batch::{WriteBatch, WriteBatchIterator};
     use crate::bytes_range::BytesRange;
     use crate::db_iter::DbIterator;
     use crate::error::SlateDBError;
     use crate::iter::{IterationOrder, RowEntryIterator};
     use crate::test_utils::TestIterator;
+    use crate::txn_buffer::{TxnBuffer, TxnBufferIterator};
     use bytes::Bytes;
     use std::collections::VecDeque;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_invalidated_iterator() {
@@ -526,13 +527,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dbiterator_with_writebatch() {
-        // Create a WriteBatch with some data
-        let mut batch = WriteBatch::new();
-        batch.put(b"key1", b"value1");
-        batch.put(b"key3", b"value3");
+        // Create a TxnBuffer with some data
+        let mut buf = TxnBuffer::new(Uuid::new_v4());
+        buf.put(b"key1", b"value1");
+        buf.put(b"key3", b"value3");
 
-        // Create WriteBatchIterator
-        let wb_iter = WriteBatchIterator::new(&batch, .., IterationOrder::Ascending);
+        // Create TxnBufferIterator
+        let wb_iter = TxnBufferIterator::new(&buf, .., IterationOrder::Ascending);
 
         // Create DbIterator with WriteBatch
         let mem_iters: VecDeque<Box<dyn RowEntryIterator + 'static>> = VecDeque::new();

@@ -121,7 +121,7 @@ impl MessageHandler<WriteBatchMessage> for WriteBatchEventHandler {
 
 impl DbInner {
     #[allow(clippy::panic)]
-    #[instrument(level = "trace", skip_all, fields(batch_size = batch.ops.len()))]
+    #[instrument(level = "trace", skip_all, fields(batch_size = batch.total_ops()))]
     async fn write_batch(&self, batch: WriteBatch, options: &WriteOptions) -> WriteBatchResult {
         let _options = options;
         #[cfg(not(dst))]

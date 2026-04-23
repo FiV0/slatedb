@@ -5,7 +5,6 @@ use std::ops::RangeBounds;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::batch::{WriteBatch, WriteBatchIterator};
 use crate::bytes_range::BytesRange;
 use crate::config::{MergeOptions, PutOptions, ReadOptions, ScanOptions, WriteOptions};
 use crate::db::DbInner;
@@ -14,6 +13,7 @@ use crate::db_iter::{DbIterator, DbIteratorRangeTracker};
 use crate::error::SlateDBError;
 use crate::iter::IterationOrder;
 use crate::transaction_manager::{IsolationLevel, TransactionManager};
+use crate::txn_buffer::{TxnBuffer, TxnBufferIterator};
 use crate::types::KeyValue;
 use crate::DbRead;
 
@@ -53,15 +53,15 @@ pub struct DbTransaction {
     started_seq: u64,
     /// Reference to the transaction manager
     txn_manager: Arc<TransactionManager>,
-    /// The write batch of the transaction, which contains the uncommitted writes.
-    /// Users can read data from the write batch during the transaction, thus providing
+    /// The write buffer of the transaction, which contains the uncommitted writes.
+    /// Users can read data from the buffer during the transaction, thus providing
     /// an MVCC view of the database.
     ///
     /// DbTransaction is not intended for concurrent use; we use `RwLock` (not `RefCell`) for
     /// interior mutability to preserve `Sync` in async contexts. `RefCell` is `!Sync` and would
     /// make `DbTransaction` `!Sync`, which is incompatible with async code using the `DbRead`
     /// trait.
-    write_batch: RwLock<WriteBatch>,
+    write_buffer: RwLock<TxnBuffer>,
     /// Reference to the database
     db_inner: Arc<DbInner>,
     /// Isolation level for this transaction
@@ -85,7 +85,7 @@ impl DbTransaction {
             txn_id,
             started_seq: seq,
             txn_manager,
-            write_batch: RwLock::new(WriteBatch::new().with_txn_id(txn_id)),
+            write_buffer: RwLock::new(TxnBuffer::new(txn_id)),
             db_inner,
             isolation_level,
             range_trackers: Mutex::new(Vec::new()),
@@ -158,8 +158,8 @@ impl DbTransaction {
         let key_slice = key.as_ref();
         let range = BytesRange::from_slice(key_slice..=key_slice);
         let write_batch_iter = {
-            let guard = self.write_batch.read();
-            Some(WriteBatchIterator::new(
+            let guard = self.write_buffer.read();
+            Some(TxnBufferIterator::new(
                 &guard,
                 range,
                 IterationOrder::Ascending,
@@ -241,8 +241,8 @@ impl DbTransaction {
         // only the entries in the scan range.
         let range = BytesRange::from(range);
         let write_batch_iter = {
-            let guard = self.write_batch.read();
-            Some(WriteBatchIterator::new(
+            let guard = self.write_buffer.read();
+            Some(TxnBufferIterator::new(
                 &guard,
                 range.clone(),
                 options.order,
@@ -339,7 +339,7 @@ impl DbTransaction {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.write_batch
+        self.write_buffer
             .write()
             .put_with_options(key, value, options);
         Ok(())
@@ -454,7 +454,7 @@ impl DbTransaction {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        self.write_batch
+        self.write_buffer
             .write()
             .merge_with_options(key, value, options);
         Ok(())
@@ -470,7 +470,7 @@ impl DbTransaction {
     /// - It's not really possible to have error here, since the delete operation is
     ///   buffered in the write batch.
     pub fn delete<K: AsRef<[u8]>>(&self, key: K) -> Result<(), crate::Error> {
-        self.write_batch.write().delete(key);
+        self.write_buffer.write().delete(key);
         Ok(())
     }
 
@@ -517,9 +517,6 @@ impl DbTransaction {
         self,
         options: &WriteOptions,
     ) -> Result<Option<WriteHandle>, crate::Error> {
-        // Take the write_batch for submission to the database.
-        let write_batch = self.write_batch.read().clone();
-
         // Extract actual scanned ranges from trackers for SSI conflict detection
         if self.isolation_level == IsolationLevel::SerializableSnapshot {
             for tracker in self.range_trackers.lock().iter() {
@@ -531,16 +528,21 @@ impl DbTransaction {
             }
         }
 
-        // If the WriteBatch is empty, it's a no-op or read-only batch.
-        if write_batch.is_empty() {
-            // Check for read conflicts before returning Ok(None).
-            if let Some(txn_id) = write_batch.txn_id.as_ref() {
-                if self.txn_manager.check_has_conflict(txn_id) {
+        // If the buffer is empty, it's a no-op or read-only transaction.
+        {
+            let guard = self.write_buffer.read();
+            if guard.is_empty() {
+                // Check for read conflicts before returning Ok(None).
+                if self.txn_manager.check_has_conflict(&guard.txn_id) {
                     return Err(SlateDBError::TransactionConflict.into());
                 }
+                return Ok(None);
             }
-            return Ok(None);
         }
+
+        // Snapshot the buffer and convert it into a WriteBatch for the
+        // write pipeline (which is typed on WriteBatch).
+        let write_batch = self.write_buffer.read().to_write_batch();
 
         // Track only write keys that were not explicitly unmarked.
         let tracked_write_keys = {
