@@ -67,6 +67,7 @@ use crate::oracle::{DbOracle, Oracle};
 use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::reader::Reader;
+use crate::reaper::Reaper;
 use crate::snapshot_manager::SnapshotManager;
 use crate::sst_iter::SstIteratorOptions;
 use crate::tablestore::TableStore;
@@ -115,6 +116,9 @@ pub(crate) struct DbInner {
     pub(crate) txn_manager: Arc<TransactionManager>,
     pub(crate) snapshot_manager: Arc<SnapshotManager>,
     pub(crate) status_manager: DbStatusManager,
+    /// Background task that drops submitted values off the critical path and
+    /// serializes drops to avoid allocator-arena contention. See `reaper.rs`.
+    pub(crate) reaper: Arc<Reaper>,
 }
 
 impl DbInner {
@@ -181,6 +185,7 @@ impl DbInner {
 
         let txn_manager = Arc::new(TransactionManager::new(oracle.clone(), rand.clone()));
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
+        let reaper = Arc::new(Reaper::start());
 
         let db_inner = Self {
             state,
@@ -202,6 +207,7 @@ impl DbInner {
             txn_manager,
             snapshot_manager,
             status_manager,
+            reaper,
         };
         Ok(db_inner)
     }
@@ -714,6 +720,8 @@ impl Db {
         if let Err(e) = self.inner.table_store.close_cache().await {
             warn!("failed to close block cache [error={:?}]", e);
         }
+
+        self.inner.reaper.shutdown().await;
 
         info!("db closed");
         Ok(())

@@ -141,6 +141,7 @@ mod peeking_iterator;
 mod proptest_util;
 mod rand;
 mod reader;
+mod reaper;
 mod retention_iterator;
 mod retrying_object_store;
 mod snapshot_manager;
