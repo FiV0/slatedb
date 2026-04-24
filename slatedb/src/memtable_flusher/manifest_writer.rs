@@ -655,6 +655,7 @@ impl ManifestWriterHandler {
         let _ = self
             .tracker_tx
             .send(TrackerMessage::FlushComplete { through_seq });
+        self.db.reaper.submit(staged_batch);
         Ok(())
     }
 
@@ -678,7 +679,7 @@ impl ManifestWriterHandler {
         attached_checkpoints: Vec<PendingCheckpoint>,
         err: SlateDBError,
     ) -> Result<(), SlateDBError> {
-        for uploaded in staged_batch {
+        for uploaded in &staged_batch {
             uploaded
                 .imm_memtable
                 .table()
@@ -687,6 +688,7 @@ impl ManifestWriterHandler {
         for checkpoint in attached_checkpoints {
             let _ = checkpoint.sender.send(Err(err.clone()));
         }
+        self.db.reaper.submit(staged_batch);
         Ok(())
     }
 
