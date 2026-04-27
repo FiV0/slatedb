@@ -46,6 +46,8 @@ use uuid::Uuid;
 pub struct WriteBatch {
     pub(crate) ops: HashMap<Bytes, KeyOps>,
     pub(crate) txn_id: Option<Uuid>,
+    /// Number of individual write ops surviving after per-key deduplication.
+    total_op_count: usize,
 }
 
 /// Ops accumulated for a single user key in a [`WriteBatch`].
@@ -146,6 +148,7 @@ impl WriteBatch {
         WriteBatch {
             ops: HashMap::new(),
             txn_id: None,
+            total_op_count: 0,
         }
     }
 
@@ -153,6 +156,7 @@ impl WriteBatch {
         Self {
             ops: self.ops,
             txn_id: Some(txn_id),
+            total_op_count: self.total_op_count,
         }
     }
 
@@ -234,13 +238,17 @@ impl WriteBatch {
 
         // put will overwrite the existing key so we can safely
         // remove all previous entries.
-        self.ops.insert(
+        let old = self.ops.insert(
             key.clone(),
             KeyOps {
                 base: Some(WriteOp::Put(key, value, options.clone())),
                 merges: Vec::new(),
             },
         );
+        self.total_op_count += 1;
+        if let Some(old) = old {
+            self.total_op_count -= old.total_ops();
+        }
     }
 
     /// Merge a key-value pair into the batch. Keys must not be empty.
@@ -264,6 +272,7 @@ impl WriteBatch {
         let value = Bytes::copy_from_slice(value.as_ref());
         let op = WriteOp::Merge(key.clone(), value, options.clone());
         self.ops.entry(key).or_default().merges.push(op);
+        self.total_op_count += 1;
     }
 
     /// Delete a key-value pair into the batch. Keys must not be empty.
@@ -274,13 +283,17 @@ impl WriteBatch {
 
         // delete will overwrite the existing key so we can safely
         // remove all previous entries.
-        self.ops.insert(
+        let old = self.ops.insert(
             key.clone(),
             KeyOps {
                 base: Some(WriteOp::Delete(key)),
                 merges: Vec::new(),
             },
         );
+        self.total_op_count += 1;
+        if let Some(old) = old {
+            self.total_op_count -= old.total_ops();
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -290,7 +303,7 @@ impl WriteBatch {
     /// Total number of individual write ops (puts + deletes + merges) surviving
     /// in this batch after per-key deduplication.
     pub(crate) fn total_ops(&self) -> usize {
-        self.ops.values().map(KeyOps::total_ops).sum()
+        self.total_op_count
     }
 
     pub(crate) fn keys(&self) -> HashSet<Bytes> {
@@ -696,6 +709,42 @@ mod tests {
             }
             other => panic!("Expected Delete base, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn should_track_total_ops_incrementally() {
+        let mut batch = WriteBatch::new();
+        assert_eq!(batch.total_ops(), 0);
+
+        batch.put(b"key1", b"value1");
+        assert_eq!(batch.total_ops(), 1);
+
+        batch.merge(b"key1", b"merge1");
+        batch.merge(b"key1", b"merge2");
+        assert_eq!(batch.total_ops(), 3);
+
+        batch.merge(b"key2", b"merge3");
+        assert_eq!(batch.total_ops(), 4);
+
+        batch.put(b"key1", b"value2");
+        assert_eq!(batch.total_ops(), 2);
+
+        batch.delete(b"key2");
+        assert_eq!(batch.total_ops(), 2);
+
+        batch.delete(b"key3");
+        assert_eq!(batch.total_ops(), 3);
+    }
+
+    #[test]
+    fn should_preserve_total_ops_when_adding_txn_id() {
+        let mut batch = WriteBatch::new();
+        batch.put(b"key1", b"value1");
+        batch.merge(b"key2", b"merge1");
+
+        let batch = batch.with_txn_id(Uuid::new_v4());
+
+        assert_eq!(batch.total_ops(), 2);
     }
 
     // -------- extract_entries tests --------
