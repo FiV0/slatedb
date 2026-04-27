@@ -300,8 +300,10 @@ impl WriteBatch {
     /// Materialize this batch into [`RowEntry`] objects with the given commit
     /// seq and timestamp set. If a merge operator is provided, any stacked
     /// merges for the same key are folded into a single entry. The resulting
-    /// `Vec` is unordered — downstream consumers (WAL buffer, memtable) use
-    /// `SkipMap` storage that sorts on insert.
+    /// `Vec` is sorted by (`key` asc, `seq` desc) to match the memtable
+    /// SkipMap key order, giving sequential inserts on the downstream
+    /// `SkipMap` storage rather than random-order inserts driven by the
+    /// `HashMap` iteration order.
     pub(crate) async fn extract_entries(
         &self,
         seq: u64,
@@ -344,6 +346,7 @@ impl WriteBatch {
                 }
             }
         }
+        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key).then(a.seq.cmp(&b.seq).reverse()));
         Ok(entries)
     }
 }
