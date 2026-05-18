@@ -8097,12 +8097,15 @@ func (_ FfiDestroyerCompactorStateView) Destroy(value CompactorStateView) {
 type DbStatus struct {
 	// Highest durable sequence number observed by this handle.
 	DurableSeq uint64
+	// Largest WAL ID whose contents are readable through this handle.
+	LastReplayedWalId uint64
 	// Present once the handle has been closed.
 	CloseReason *CloseReason
 }
 
 func (r *DbStatus) Destroy() {
 	FfiDestroyerUint64{}.Destroy(r.DurableSeq)
+	FfiDestroyerUint64{}.Destroy(r.LastReplayedWalId)
 	FfiDestroyerOptionalCloseReason{}.Destroy(r.CloseReason)
 }
 
@@ -8116,6 +8119,7 @@ func (c FfiConverterDbStatus) Lift(rb RustBufferI) DbStatus {
 
 func (c FfiConverterDbStatus) Read(reader io.Reader) DbStatus {
 	return DbStatus{
+		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterOptionalCloseReasonINSTANCE.Read(reader),
 	}
@@ -8131,6 +8135,7 @@ func (c FfiConverterDbStatus) LowerExternal(value DbStatus) ExternalCRustBuffer 
 
 func (c FfiConverterDbStatus) Write(writer io.Writer, value DbStatus) {
 	FfiConverterUint64INSTANCE.Write(writer, value.DurableSeq)
+	FfiConverterUint64INSTANCE.Write(writer, value.LastReplayedWalId)
 	FfiConverterOptionalCloseReasonINSTANCE.Write(writer, value.CloseReason)
 }
 

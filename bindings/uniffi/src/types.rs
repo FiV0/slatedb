@@ -116,6 +116,8 @@ impl From<slatedb::WriteHandle> for WriteHandle {
 pub struct DbStatus {
     /// Highest durable sequence number observed by this handle.
     pub durable_seq: u64,
+    /// Largest WAL ID whose contents are readable through this handle.
+    pub last_replayed_wal_id: u64,
     /// Present once the handle has been closed.
     pub close_reason: Option<CloseReason>,
 }
@@ -124,6 +126,7 @@ impl From<slatedb::DbStatus> for DbStatus {
     fn from(value: slatedb::DbStatus) -> Self {
         Self {
             durable_seq: value.durable_seq,
+            last_replayed_wal_id: value.last_replayed_wal_id,
             close_reason: value.close_reason.map(Into::into),
         }
     }
