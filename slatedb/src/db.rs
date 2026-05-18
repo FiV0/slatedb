@@ -4034,6 +4034,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        assert_eq!(db.status().last_replayed_wal_id, 0);
         db.delete_with_options(
             &[b'b'; 4],
             &WriteOptions {
@@ -4052,6 +4053,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        assert_eq!(db.status().last_replayed_wal_id, 0);
         let val = db.get(&[b'a'; 4]).await.unwrap();
         assert_eq!(val.unwrap(), Bytes::copy_from_slice(&[b'z'; 64]));
         let val = db.get(&[b'b'; 4]).await.unwrap();
