@@ -366,6 +366,7 @@ impl WalBufferManager {
                     inner.oracle.advance_durable_seq(seq);
                 }
             }
+            self.status_manager.report_last_replayed_wal_id(*wal_id);
 
             // notify durable only when the flush is successful.
             wal.notify_durable(result.clone());

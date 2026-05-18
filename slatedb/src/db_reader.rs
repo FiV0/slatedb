@@ -145,6 +145,7 @@ impl DbReaderInner {
             .max(initial_state.core().last_l0_seq);
         status_manager.report_durable_seq(initial_durable_seq);
         status_manager.report_manifest(VersionedManifest::from(initial_state.as_ref()));
+        status_manager.report_last_replayed_wal_id(initial_state.last_wal_id);
         let oracle = Arc::new(DbReaderOracle::new(
             initial_durable_seq,
             status_manager.clone(),
@@ -313,6 +314,7 @@ impl DbReaderInner {
                 last_wal_id,
                 last_remote_persisted_seq: last_committed_seq,
             });
+            self.status_manager.report_last_replayed_wal_id(last_wal_id);
         }
         Ok(())
     }
@@ -2782,6 +2784,47 @@ mod tests {
             "durable_seq should advance: {} > {}",
             updated_seq,
             initial_seq
+        );
+
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_subscribe_to_last_replayed_wal_id_updates() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_watch_wal_id");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        let reader_options = DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(10),
+            ..DbReaderOptions::default()
+        };
+        let reader = test_provider
+            .new_db_reader(reader_options, None, None)
+            .await
+            .unwrap();
+        let mut rx = reader.subscribe();
+        let initial_last_replayed_wal_id = rx.borrow().last_replayed_wal_id;
+
+        db.put(b"k1", b"v1").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            rx.wait_for(|status| status.last_replayed_wal_id > initial_last_replayed_wal_id),
+        )
+        .await
+        .expect("timed out waiting for last replayed WAL ID update")
+        .expect("watch channel closed");
+        assert_eq!(
+            reader.get(b"k1").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
         );
 
         reader.close().await.unwrap();
