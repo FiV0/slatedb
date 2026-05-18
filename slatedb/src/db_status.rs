@@ -20,6 +20,12 @@ pub struct DbStatus {
     /// The current in-memory manifest snapshot observed by this handle,
     /// paired with its manifest version ID.
     pub current_manifest: VersionedManifest,
+    /// The largest WAL ID whose contents are readable through this handle.
+    ///
+    /// For [`crate::Db`], this advances after a WAL flush succeeds. For
+    /// [`crate::DbReader`], this advances after WAL files are replayed into the
+    /// reader's read state. WAL-disabled configurations report `0`.
+    pub last_replayed_wal_id: u64,
     /// Set once the database has been closed, indicating the reason.
     pub close_reason: Option<CloseReason>,
 }
@@ -58,6 +64,7 @@ impl DbStatusManager {
         let (tx, _) = watch::channel(DbStatus {
             durable_seq: initial_durable_seq,
             current_manifest: initial_manifest,
+            last_replayed_wal_id: 0,
             close_reason: None,
         });
         Self {
@@ -81,6 +88,17 @@ impl DbStatusManager {
         self.tx.send_if_modified(|s| {
             if versioned.id >= s.current_manifest.id && s.current_manifest != versioned {
                 s.current_manifest = versioned;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    pub(crate) fn report_last_replayed_wal_id(&self, wal_id: u64) {
+        self.tx.send_if_modified(|s| {
+            if wal_id > s.last_replayed_wal_id {
+                s.last_replayed_wal_id = wal_id;
                 true
             } else {
                 false
@@ -174,5 +192,30 @@ mod tests {
 
         // then
         assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn should_notify_on_last_replayed_wal_id_advance() {
+        let mgr = DbStatusManager::new_with_manifest(0, versioned_manifest(1));
+        let mut rx = mgr.subscribe();
+        rx.borrow_and_update();
+
+        mgr.report_last_replayed_wal_id(7);
+
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().last_replayed_wal_id, 7);
+    }
+
+    #[test]
+    fn should_not_notify_on_stale_last_replayed_wal_id() {
+        let mgr = DbStatusManager::new_with_manifest(0, versioned_manifest(1));
+        mgr.report_last_replayed_wal_id(7);
+        let mut rx = mgr.subscribe();
+        rx.borrow_and_update();
+
+        mgr.report_last_replayed_wal_id(6);
+
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(rx.borrow().last_replayed_wal_id, 7);
     }
 }

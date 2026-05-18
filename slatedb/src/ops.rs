@@ -519,10 +519,19 @@ pub trait DbMetadataOps {
     /// Subscribe to database state changes.
     ///
     /// Returns a [`tokio::sync::watch::Receiver<DbStatus>`] that always
-    /// reflects the latest database status. The status includes the latest durable
-    /// sequence number and the current manifest snapshot observed by this
-    /// handle. For [`Db`](crate::Db) is is the current in-memory snapshot and
-    /// for [`DbReader`](crate::DbReader) it is the latest manifest polled from object storage.
+    /// reflects the latest database status. The status includes the latest
+    /// durable sequence number, the largest WAL ID processed into this handle's
+    /// read state, and the current manifest snapshot observed by this handle.
+    /// For [`Db`](crate::Db), the manifest is the current in-memory snapshot
+    /// and `last_replayed_wal_id` advances after a successful WAL flush. For
+    /// [`DbReader`](crate::DbReader), the manifest is the latest manifest
+    /// polled from object storage and `last_replayed_wal_id` advances after the
+    /// reader polls and replays WAL files.
+    ///
+    /// A status update may be published by any status field changing. For
+    /// example, `last_replayed_wal_id` can advance independently of
+    /// `durable_seq`, `current_manifest`, and `close_reason`.
+    ///
     /// For example, you can wait for a specific sequence number to
     /// become durable:
     ///

@@ -89,6 +89,9 @@ impl DbInner {
         let dirty_manifest = guard.state().manifest.clone();
         drop(guard);
         self.status_manager.report_manifest(dirty_manifest.into());
+        if self.wal_enabled {
+            self.status_manager.report_last_replayed_wal_id(last_wal);
+        }
         Ok(())
     }
 }

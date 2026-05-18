@@ -210,6 +210,11 @@ impl DbInner {
             status_manager,
             segment_extractor,
         };
+        if db_inner.wal_enabled {
+            db_inner
+                .status_manager
+                .report_last_replayed_wal_id(recent_flushed_wal_id);
+        }
         Ok(db_inner)
     }
 
@@ -4029,6 +4034,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        assert_eq!(db.status().last_replayed_wal_id, 0);
         db.delete_with_options(
             &[b'b'; 4],
             &WriteOptions {
@@ -4047,6 +4053,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        assert_eq!(db.status().last_replayed_wal_id, 0);
         let val = db.get(&[b'a'; 4]).await.unwrap();
         assert_eq!(val.unwrap(), Bytes::copy_from_slice(&[b'z'; 64]));
         let val = db.get(&[b'b'; 4]).await.unwrap();
@@ -7816,6 +7823,40 @@ mod tests {
             "expected durable seq >= 3, got {}",
             status.durable_seq
         );
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_notify_last_replayed_wal_id_watcher_on_wal_flush() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_watch_wal_id", object_store)
+            .build()
+            .await
+            .unwrap();
+        let mut watcher = db.subscribe();
+        let initial_last_replayed_wal_id = watcher.borrow().last_replayed_wal_id;
+
+        db.put(b"key1", b"value1").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::Wal,
+        })
+        .await
+        .unwrap();
+        let expected_last_replayed_wal_id = db.inner.wal_buffer.recent_flushed_wal_id();
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            watcher.wait_for(|s| {
+                s.last_replayed_wal_id >= expected_last_replayed_wal_id
+                    && s.last_replayed_wal_id > initial_last_replayed_wal_id
+            }),
+        )
+        .await
+        .expect("timed out waiting for last replayed WAL ID update")
+        .expect("watch channel closed")
+        .clone();
+        assert_eq!(status.last_replayed_wal_id, expected_last_replayed_wal_id);
 
         db.close().await.unwrap();
     }
