@@ -118,6 +118,12 @@ test = false
 bench = false
 
 [[bin]]
+name = "memtable-seek"
+path = "src/memtable_seek.rs"
+test = false
+bench = false
+
+[[bin]]
 name = "write-runtime"
 path = "src/write_runtime.rs"
 test = false
